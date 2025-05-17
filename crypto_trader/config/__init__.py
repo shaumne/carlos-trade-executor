@@ -1,0 +1,1 @@
+from crypto_trader.config.config import * 
