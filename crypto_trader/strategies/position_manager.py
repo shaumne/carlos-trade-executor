@@ -372,50 +372,49 @@ class PositionManager:
         while checks < max_checks:
             try:
                 # Get order details
-                order_details = self.exchange_api.get_order_details(order_id)
+                method = "private/get-order-detail"
+                params = {"order_id": order_id}
+                order_detail = self.exchange_api.send_request(method, params)
                 
-                if not order_details:
+                if not order_detail or order_detail.get("code") != 0:
                     logger.warning(f"Could not get details for order {order_id}")
                     time.sleep(check_interval)
                     checks += 1
                     continue
                 
-                status = order_details.get('status', '').upper()
+                result = order_detail.get("result", {})
+                status = result.get("status")
+                cumulative_quantity = float(result.get("cumulative_quantity", 0))
+                avg_price = float(result.get("avg_price", 0))
                 
-                # Log order details for debugging
                 logger.debug(f"Order {order_id} status: {status}")
                 
-                # Check for successful fill
-                if status == 'FILLED':
-                    # Update position with actual fill details
-                    filled_quantity = float(order_details.get('cumulative_quantity', 0))
-                    filled_price = float(order_details.get('average_price', 0))
-                    
-                    if filled_quantity > 0 and filled_price > 0:
-                        position.quantity = filled_quantity
-                        position.price = filled_price
-                        position.status = "POSITION_ACTIVE"
-                        
-                        logger.info(f"Order {order_id} filled: {filled_quantity} @ {filled_price}")
-                        return True
+                # MARKET emirleri için özel kontrol
+                # Eğer emir CANCELED ama bir miktar alım yapılmışsa, başarılı sayılır
+                if status == "CANCELED" and cumulative_quantity > 0:
+                    logger.info(f"Market order {order_id} executed with quantity {cumulative_quantity} before cancellation")
+                    position.quantity = cumulative_quantity
+                    position.price = avg_price
+                    position.status = "POSITION_ACTIVE"
+                    return True
                 
-                # Check for final states
-                elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
-                    # Only consider it canceled if we're sure
-                    if checks >= 2:  # Wait for at least 2 checks to confirm cancellation
-                        logger.warning(f"Order {order_id} {status.lower()}")
+                # Normal FILLED kontrolü
+                elif status == "FILLED":
+                    position.quantity = cumulative_quantity
+                    position.price = avg_price
+                    position.status = "POSITION_ACTIVE"
+                    logger.info(f"Order {order_id} filled: {cumulative_quantity} @ {avg_price}")
+                    return True
+                
+                # Gerçekten iptal edilmiş ve hiç işlem yapılmamış
+                elif status == "CANCELED" and cumulative_quantity == 0:
+                    if checks >= 2:  # En az 2 kontrol yap
+                        logger.warning(f"Order {order_id} cancelled with no execution")
                         return False
                 
-                # Still processing
-                elif status in ['ACTIVE', 'PROCESSING', 'PENDING']:
-                    logger.debug(f"Order {order_id} still {status.lower()}")
-                    time.sleep(check_interval)
-                    checks += 1
-                    continue
-                
-                # Unknown status
+                # Diğer durumlar için bekle
                 else:
-                    logger.warning(f"Unknown order status for {order_id}: {status}")
+                    logger.debug(f"Order {order_id} status: {status}, waiting...")
                     time.sleep(check_interval)
                     checks += 1
                     continue
