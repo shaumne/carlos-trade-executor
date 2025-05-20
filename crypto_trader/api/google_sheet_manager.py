@@ -360,10 +360,21 @@ class GoogleSheetManager:
             def format_number_for_sheet(value):
                 if value is None:
                     return ""
-                if isinstance(value, (int, float)):
-                    # Prevent scientific notation, use 8 decimals max
-                    return "{:.8f}".format(value).rstrip("0").rstrip(".")
-                return str(value)
+                try:
+                    # Convert to float first
+                    value = float(value)
+                    
+                    # Format with 4 decimal places, no scientific notation
+                    formatted = "{:.4f}".format(value)
+                    
+                    # If the number is too large, it might still use scientific notation
+                    # In that case, convert it to a regular decimal
+                    if 'e' in formatted.lower():
+                        formatted = "{:.4f}".format(float(formatted))
+                    
+                    return formatted.rstrip("0").rstrip(".")
+                except (ValueError, TypeError):
+                    return str(value)
             
             # Prepare batch updates
             updates = []

@@ -353,67 +353,78 @@ class PositionManager:
     
     def _monitor_order(self, position, max_checks=30, check_interval=5):
         """
-        Monitor an order until it's filled or cancelled
+        Monitor order until it's filled or timeout
         
         Args:
             position (Position): Position to monitor
-            max_checks (int): Maximum number of checks
-            check_interval (int): Seconds between checks
+            max_checks (int): Maximum number of status checks
+            check_interval (float): Time between checks in seconds
             
         Returns:
-            bool: True if filled, False otherwise
+            bool: True if order filled, False otherwise
         """
-        symbol = position.symbol
         order_id = position.order_id
-        
-        if not order_id or order_id == "success_no_id":
-            # Handle successful orders without ID (assume filled)
-            position.update_status("POSITION_ACTIVE")
-            logger.info(f"Order without ID for {symbol} assumed filled")
-            return True
-        
+        symbol = position.symbol
         checks = 0
+        
+        logger.info(f"Monitoring order {order_id} for {symbol}")
+        
         while checks < max_checks:
-            # Get order status
-            status = self.exchange_api.get_order_status(order_id)
-            
-            if status == "FILLED":
-                # Order filled successfully
-                position.update_status("POSITION_ACTIVE")
+            try:
+                # Get order details
+                order_details = self.exchange_api.get_order_details(order_id)
                 
-                # Try to get actual filled quantity and price
-                try:
-                    method = "private/get-order-detail"
-                    params = {"order_id": order_id}
+                if not order_details:
+                    logger.warning(f"Could not get details for order {order_id}")
+                    time.sleep(check_interval)
+                    checks += 1
+                    continue
+                
+                status = order_details.get('status', '').upper()
+                
+                # Log order details for debugging
+                logger.debug(f"Order {order_id} status: {status}")
+                
+                # Check for successful fill
+                if status == 'FILLED':
+                    # Update position with actual fill details
+                    filled_quantity = float(order_details.get('cumulative_quantity', 0))
+                    filled_price = float(order_details.get('average_price', 0))
                     
-                    response = self.exchange_api.send_request(method, params)
-                    
-                    if response and response.get("code") == 0:
-                        result = response.get("result", {})
+                    if filled_quantity > 0 and filled_price > 0:
+                        position.quantity = filled_quantity
+                        position.price = filled_price
+                        position.status = "POSITION_ACTIVE"
                         
-                        if "cumulative_quantity" in result:
-                            actual_quantity = float(result.get("cumulative_quantity"))
-                            position.quantity = actual_quantity
-                            logger.info(f"Updated actual quantity for {symbol}: {actual_quantity}")
-                            
-                        if "avg_price" in result:
-                            actual_price = float(result.get("avg_price"))
-                            position.price = actual_price
-                            position.highest_price = actual_price
-                            logger.info(f"Updated actual price for {symbol}: {actual_price}")
-                except Exception as e:
-                    logger.error(f"Error getting order details: {str(e)}")
+                        logger.info(f"Order {order_id} filled: {filled_quantity} @ {filled_price}")
+                        return True
                 
-                logger.info(f"Order {order_id} for {symbol} is filled")
-                return True
+                # Check for final states
+                elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                    # Only consider it canceled if we're sure
+                    if checks >= 2:  # Wait for at least 2 checks to confirm cancellation
+                        logger.warning(f"Order {order_id} {status.lower()}")
+                        return False
                 
-            elif status in ["CANCELED", "REJECTED", "EXPIRED"]:
-                logger.warning(f"Order {order_id} for {symbol} is {status}")
-                return False
-            
-            # Wait before checking again
-            time.sleep(check_interval)
-            checks += 1
+                # Still processing
+                elif status in ['ACTIVE', 'PROCESSING', 'PENDING']:
+                    logger.debug(f"Order {order_id} still {status.lower()}")
+                    time.sleep(check_interval)
+                    checks += 1
+                    continue
+                
+                # Unknown status
+                else:
+                    logger.warning(f"Unknown order status for {order_id}: {status}")
+                    time.sleep(check_interval)
+                    checks += 1
+                    continue
+                
+            except Exception as e:
+                logger.error(f"Error checking order {order_id}: {str(e)}")
+                time.sleep(check_interval)
+                checks += 1
+                continue
         
         logger.warning(f"Monitoring timed out for order {order_id}")
         return False

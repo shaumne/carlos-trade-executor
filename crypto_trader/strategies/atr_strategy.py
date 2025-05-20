@@ -109,10 +109,10 @@ class ATRStrategy:
         """
         try:
             # Normalize price if needed
-            entry_price = normalize_price(entry_price, symbol)
+            entry_price = float(entry_price)
             
             if swing_low:
-                swing_low = normalize_price(swing_low, symbol)
+                swing_low = float(swing_low)
             
             # Calculate ATR
             atr = self.calculate_atr(symbol)
@@ -128,13 +128,16 @@ class ATRStrategy:
             else:
                 final_stop_loss = atr_stop_loss
             
+            # Format to 4 decimal places
+            final_stop_loss = round(float(final_stop_loss), 4)
+            
             logger.info(f"Calculated stop loss for {symbol}: {final_stop_loss} (Entry: {entry_price}, ATR: {atr})")
             return final_stop_loss
             
         except Exception as e:
             logger.error(f"Error calculating stop loss for {symbol}: {str(e)}")
-            # Default to 5% below entry
-            return entry_price * 0.95
+            # Default to 5% below entry with 4 decimal places
+            return round(float(entry_price) * 0.95, 4)
     
     def calculate_take_profit(self, symbol, entry_price, resistance_level=None):
         """
@@ -149,31 +152,54 @@ class ATRStrategy:
             float: Take profit price
         """
         try:
-            # Normalize price if needed
-            entry_price = normalize_price(entry_price, symbol)
-            
-            if resistance_level:
-                resistance_level = normalize_price(resistance_level, symbol)
+            # Convert entry price to float and ensure it's a valid number
+            entry_price = float(entry_price)
+            if entry_price <= 0:
+                raise ValueError("Entry price must be positive")
             
             # Calculate ATR
             atr = self.calculate_atr(symbol)
+            if not atr:
+                logger.warning(f"Cannot calculate ATR for {symbol}, using default take profit")
+                # Default to 3% above entry
+                return round(entry_price * 1.03, 4)
             
-            # Minimum take profit distance (ATR based)
+            # Convert ATR to float and validate
+            atr = float(atr)
+            if atr <= 0:
+                logger.warning(f"Invalid ATR value {atr} for {symbol}, using default")
+                atr = entry_price * 0.02  # Default to 2% of entry price
+            
+            # Calculate minimum take profit distance (ATR based)
             minimum_tp_distance = entry_price + (atr * self.multiplier)
             
-            # If resistance level provided and higher than minimum, use it
-            if resistance_level and resistance_level > minimum_tp_distance:
-                final_take_profit = resistance_level
+            # If resistance level provided and valid, use it if higher than minimum
+            if resistance_level:
+                try:
+                    resistance_level = float(resistance_level)
+                    if resistance_level > minimum_tp_distance:
+                        final_take_profit = resistance_level
+                    else:
+                        final_take_profit = minimum_tp_distance
+                except (ValueError, TypeError):
+                    final_take_profit = minimum_tp_distance
             else:
                 final_take_profit = minimum_tp_distance
+            
+            # Ensure the take profit is not too far from entry price (max 10%)
+            max_tp = entry_price * 1.10
+            final_take_profit = min(final_take_profit, max_tp)
+            
+            # Format to 4 decimal places
+            final_take_profit = round(final_take_profit, 4)
             
             logger.info(f"Calculated take profit for {symbol}: {final_take_profit} (Entry: {entry_price}, ATR: {atr})")
             return final_take_profit
             
         except Exception as e:
             logger.error(f"Error calculating take profit for {symbol}: {str(e)}")
-            # Default to 10% above entry
-            return entry_price * 1.10
+            # Default to 3% above entry with 4 decimal places
+            return round(float(entry_price) * 1.03, 4)
     
     def calculate_trailing_stop(self, symbol, current_price, current_stop_loss, highest_price=None):
         """
