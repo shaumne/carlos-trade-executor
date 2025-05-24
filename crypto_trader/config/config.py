@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import os.path
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -46,7 +47,7 @@ DEFAULT_PRECISION = 2
 
 # Log Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_FILE = "crypto_trader.log"
+LOG_FILE = os.getenv("LOG_FILE", os.path.join(os.path.expanduser("~"), "crypto_trader.log"))
 
 # Retry Configuration
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))

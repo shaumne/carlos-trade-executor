@@ -30,6 +30,11 @@ class Position:
         self.sl_order_id = sl_order_id  # Stop loss order ID
         self.created_at = datetime.now()
         self.updated_at = datetime.now()
+        self.is_open = True  # Position is open by default when created
+        self.exit_price = None
+        self.exit_time = None
+        self.exit_type = None  # 'tp', 'sl', or 'manual'
+        self.pnl = None  # Realized profit/loss
         
     def update_tp_sl(self, take_profit=None, stop_loss=None):
         """Update take profit and stop loss levels"""
@@ -45,6 +50,38 @@ class Position:
         """Update position status"""
         self.status = status
         self.updated_at = datetime.now()
+        
+        # If status indicates position is closed, update is_open
+        if status in ["SOLD", "CLOSED", "CANCELLED"]:
+            self.is_open = False
+    
+    def close_position(self, exit_price, exit_type="manual"):
+        """Close the position with exit details"""
+        self.is_open = False
+        self.exit_price = exit_price
+        self.exit_time = datetime.now()
+        self.exit_type = exit_type
+        self.status = "SOLD"
+        
+        # Calculate PnL if we have entry and exit prices
+        if self.price and exit_price and self.quantity:
+            self.pnl = (exit_price - self.price) * self.quantity
+        
+        self.updated_at = datetime.now()
+    
+    @property
+    def duration(self):
+        """Get position duration in seconds"""
+        if self.exit_time:
+            return (self.exit_time - self.created_at).total_seconds()
+        return (datetime.now() - self.created_at).total_seconds()
+    
+    def __str__(self):
+        """String representation of the position"""
+        return (f"Position({self.symbol}, {self.status}, "
+                f"qty={self.quantity}, price={self.price}, "
+                f"tp={self.take_profit}, sl={self.stop_loss}, "
+                f"is_open={self.is_open})")
 
 class PositionManager:
     """
@@ -257,7 +294,7 @@ class PositionManager:
             
             if is_filled:
                 # Place TP/SL orders
-                self._place_tp_sl_orders(position)
+                self._place_tp_sl_orders(position, take_profit, stop_loss)
                 
                 # Send notification
                 self._notify_order_filled(position)
@@ -312,43 +349,97 @@ class PositionManager:
                     status="POSITION_ACTIVE"
                 )
             
-            # Cancel any TP/SL orders
+            # Cancel any TP/SL orders first
             self._cancel_tp_sl_orders(position)
             
-            # Execute sell order
-            sell_order_id = self.exchange_api.sell_coin(symbol, position.quantity)
+            # Wait a moment after cancelling orders
+            time.sleep(2)
             
-            if not sell_order_id:
-                logger.error(f"Failed to create sell order for {symbol}")
+            # Get current balance to ensure we have the correct amount
+            base_currency = original_symbol
+            current_balance = self.exchange_api.get_balance(base_currency)
+            
+            if current_balance <= 0:
+                logger.warning(f"No balance available for {base_currency} after cancelling orders")
                 return False
+                
+            # Update position quantity with current balance
+            position.quantity = current_balance
             
-            # Update sheet
-            self.sheet_manager.update_trade_status(
-                row_index,
-                "SOLD",
-                sell_price=self.exchange_api.get_current_price(symbol),
-                quantity=position.quantity
-            )
+            # Get current price for logging
+            current_price = self.exchange_api.get_current_price(symbol)
             
-            # Move to archive
-            self.sheet_manager.move_to_archive(row_index)
+            # Execute sell order with retries
+            max_retries = 3
+            retry_count = 0
+            sell_successful = False
             
-            # Send notification
-            if self.telegram_notifier:
-                self.telegram_notifier.send_message(
-                    f"🔴 SELL Order placed:\n"
-                    f"Symbol: {symbol}\n"
-                    f"Quantity: {position.quantity}\n"
-                    f"Order ID: {sell_order_id}"
-                )
+            while retry_count < max_retries and not sell_successful:
+                sell_order_id = self.exchange_api.sell_coin(symbol, position.quantity)
+                
+                if sell_order_id:
+                    logger.info(f"Successfully created sell order {sell_order_id} for {symbol}")
+                    
+                    # Wait for order status
+                    time.sleep(2)
+                    status = self.exchange_api.get_order_status(sell_order_id)
+                    
+                    if status == "FILLED":
+                        logger.info(f"Sell order {sell_order_id} was filled")
+                        sell_successful = True
+                        
+                        # Update sheet status
+                        self.sheet_manager.update_trade_status(
+                            row_index,
+                            "SOLD",
+                            sell_price=current_price,
+                            quantity=position.quantity,
+                            sell_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        )
+                        
+                        # Send Telegram notification
+                        if self.telegram_notifier:
+                            self.telegram_notifier.send_message(
+                                f"💰 SELL Order Filled!\n"
+                                f"Symbol: {symbol}\n"
+                                f"Price: {current_price}\n"
+                                f"Quantity: {position.quantity}\n"
+                                f"Order ID: {sell_order_id}"
+                            )
+                        
+                        # Move to archive
+                        if self.sheet_manager.move_to_archive(row_index):
+                            logger.info(f"Trade moved to archive for {symbol}")
+                        
+                        # Remove from active positions
+                        self.remove_position(symbol)
+                        
+                        return True
+                    elif status == "ACTIVE":
+                        logger.info(f"Sell order {sell_order_id} is still active")
+                        sell_successful = True
+                        return True
+                    elif status == "CANCELED" and retry_count < max_retries - 1:
+                        logger.warning(f"Order {sell_order_id} was cancelled, retrying...")
+                        time.sleep(2)
+                        retry_count += 1
+                        continue
+                    else:
+                        logger.error(f"Unexpected order status: {status}")
+                        retry_count += 1
+                else:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        logger.warning(f"Failed to create sell order, attempt {retry_count}/{max_retries}")
+                        time.sleep(2)
+                    else:
+                        logger.error(f"Failed to create sell order after {max_retries} attempts")
+                        return False
             
-            # Remove position
-            self.remove_position(symbol)
-            
-            return True
-            
+            return sell_successful
+                
         except Exception as e:
-            logger.error(f"Error executing sell for {symbol}: {str(e)}")
+            logger.exception(f"Error executing sell for {symbol}: {str(e)}")
             return False
     
     def _monitor_order(self, position, max_checks=30, check_interval=5):
@@ -428,112 +519,160 @@ class PositionManager:
         logger.warning(f"Monitoring timed out for order {order_id}")
         return False
     
-    def _place_tp_sl_orders(self, position):
+    def _place_tp_sl_orders(self, position, take_profit, stop_loss):
         """
         Place take profit and stop loss orders
         
         Args:
-            position (Position): Position to place orders for
+            position (Position): Position object
+            take_profit (float): Take profit price
+            stop_loss (float): Stop loss price
             
         Returns:
             tuple: (tp_order_id, sl_order_id)
         """
-        symbol = position.symbol
-        quantity = position.quantity
-        
         try:
-            logger.info(f"Placing TP/SL orders for {symbol}: TP={position.take_profit}, SL={position.stop_loss}")
+            symbol = position.symbol
+            quantity = position.quantity
             
-            # Format quantity
-            formatted_quantity = format_quantity(quantity, symbol)
+            # Format quantity based on coin type
+            formatted_quantity = "{:.2f}".format(quantity)
             
-            # Check API for actual balance to be safe
-            base_currency = symbol.split('_')[0]
-            actual_balance = self.exchange_api.get_coin_balance(base_currency)
+            logger.info(f"Placing TP/SL orders for {symbol}: TP={take_profit}, SL={stop_loss}")
             
-            if actual_balance:
-                try:
-                    actual_balance_float = float(actual_balance)
-                    if actual_balance_float < quantity:
-                        logger.warning(f"Actual balance ({actual_balance_float}) is less than expected quantity ({quantity})")
-                        formatted_quantity = format_quantity(actual_balance_float * 0.99, symbol)
-                        logger.info(f"Using 99% of actual balance: {formatted_quantity}")
-                except Exception as e:
-                    logger.error(f"Error converting balance to float: {str(e)}")
+            # Place stop loss order first
+            sl_params = {
+                "instrument_name": symbol,
+                "side": "SELL",
+                "type": "STOP_LOSS",
+                "quantity": formatted_quantity,
+                "price": "{:.8f}".format(stop_loss),
+                "ref_price": "{:.8f}".format(stop_loss),
+                "ref_price_type": "MARK_PRICE"
+            }
             
-            # Update TP/SL values in Google Sheets
+            sl_response = self.exchange_api.send_request("private/create-order", sl_params)
+            sl_order_id = None
+            
+            if sl_response and sl_response.get("code") == 0:
+                sl_order_id = sl_response["result"]["order_id"]
+                logger.info(f"Successfully placed stop loss order at {stop_loss}, order ID: {sl_order_id}")
+                position.sl_order_id = sl_order_id
+            else:
+                logger.error(f"Failed to place stop loss order: {sl_response}")
+                
+                # Try with LIMIT order type
+                logger.info("Trying with LIMIT order type for SL")
+                sl_params["type"] = "LIMIT"
+                if "ref_price" in sl_params:
+                    del sl_params["ref_price"]
+                if "ref_price_type" in sl_params:
+                    del sl_params["ref_price_type"]
+                
+                sl_retry_response = self.exchange_api.send_request("private/create-order", sl_params)
+                if sl_retry_response and sl_retry_response.get("code") == 0:
+                    sl_order_id = sl_retry_response["result"]["order_id"]
+                    logger.info(f"Successfully placed SL order with LIMIT type, order ID: {sl_order_id}")
+                    position.sl_order_id = sl_order_id
+            
+            # Place take profit order
+            tp_params = {
+                "instrument_name": symbol,
+                "side": "SELL",
+                "type": "TAKE_PROFIT",
+                "quantity": formatted_quantity,
+                "price": "{:.8f}".format(take_profit),
+                "ref_price": "{:.8f}".format(take_profit),
+                "ref_price_type": "MARK_PRICE"
+            }
+            
+            tp_response = self.exchange_api.send_request("private/create-order", tp_params)
+            tp_order_id = None
+            
+            if tp_response and tp_response.get("code") == 0:
+                tp_order_id = tp_response["result"]["order_id"]
+                logger.info(f"Successfully placed take profit order at {take_profit}, order ID: {tp_order_id}")
+                position.tp_order_id = tp_order_id
+            else:
+                logger.error(f"Failed to place take profit order: {tp_response}")
+                
+                # Try with LIMIT order type
+                logger.info("Trying with LIMIT order type for TP")
+                tp_params["type"] = "LIMIT"
+                if "ref_price" in tp_params:
+                    del tp_params["ref_price"]
+                if "ref_price_type" in tp_params:
+                    del tp_params["ref_price_type"]
+                
+                tp_retry_response = self.exchange_api.send_request("private/create-order", tp_params)
+                if tp_retry_response and tp_retry_response.get("code") == 0:
+                    tp_order_id = tp_retry_response["result"]["order_id"]
+                    logger.info(f"Successfully placed TP order with LIMIT type, order ID: {tp_order_id}")
+                    position.tp_order_id = tp_order_id
+            
+            # Update sheet with TP/SL orders
             self.sheet_manager.update_trade_status(
                 position.row_index,
                 "UPDATE_TP_SL",
-                take_profit=position.take_profit,
-                stop_loss=position.stop_loss
+                stop_loss=stop_loss,
+                take_profit=take_profit
             )
-            
-            # NOTE: This method would be implemented differently depending on exchange API
-            # For Crypto.com, we'll use limit orders for now (exchange may support TP/SL orders)
-            tp_order_id = None
-            sl_order_id = None
-            
-            # Store TP/SL order IDs
-            position.tp_order_id = tp_order_id
-            position.sl_order_id = sl_order_id
             
             # Send notification
             if self.telegram_notifier:
                 self.telegram_notifier.send_message(
-                    f"🟢 Position Active:\n"
-                    f"Symbol: {symbol}\n"
-                    f"Entry Price: {position.price}\n"
-                    f"Quantity: {position.quantity}\n"
-                    f"Take Profit: {position.take_profit}\n"
-                    f"Stop Loss: {position.stop_loss}"
+                    f"🎯 TP/SL Orders Placed for {symbol}:\n"
+                    f"Take Profit: {take_profit}\n"
+                    f"Stop Loss: {stop_loss}\n"
+                    f"TP Order ID: {tp_order_id or 'Failed'}\n"
+                    f"SL Order ID: {sl_order_id or 'Failed'}"
                 )
             
             return tp_order_id, sl_order_id
             
         except Exception as e:
-            logger.error(f"Error placing TP/SL orders for {symbol}: {str(e)}")
+            logger.exception(f"Error placing TP/SL orders: {str(e)}")
             return None, None
-    
+            
     def _cancel_tp_sl_orders(self, position):
         """
-        Cancel take profit and stop loss orders
+        Cancel existing TP/SL orders for a position
         
         Args:
-            position (Position): Position to cancel orders for
+            position (Position): Position object
             
         Returns:
             bool: True if successful, False otherwise
         """
         success = True
         
-        # Cancel take profit order if exists
-        if position.tp_order_id:
-            try:
-                cancelled = self.exchange_api.cancel_order(position.tp_order_id)
-                if cancelled:
-                    logger.info(f"Cancelled TP order {position.tp_order_id} for {position.symbol}")
+        try:
+            # Cancel stop loss order if exists
+            if position.sl_order_id:
+                if self.exchange_api.cancel_order(position.sl_order_id):
+                    logger.info(f"Successfully cancelled stop loss order {position.sl_order_id}")
+                    position.sl_order_id = None
                 else:
-                    logger.warning(f"Failed to cancel TP order {position.tp_order_id} for {position.symbol}")
+                    logger.error(f"Failed to cancel stop loss order {position.sl_order_id}")
                     success = False
-            except Exception as e:
-                logger.error(f"Error cancelling TP order: {str(e)}")
-                success = False
-        
-        # Cancel stop loss order if exists
-        if position.sl_order_id:
-            try:
-                cancelled = self.exchange_api.cancel_order(position.sl_order_id)
-                if cancelled:
-                    logger.info(f"Cancelled SL order {position.sl_order_id} for {position.symbol}")
+            
+            # Cancel take profit order if exists
+            if position.tp_order_id:
+                if self.exchange_api.cancel_order(position.tp_order_id):
+                    logger.info(f"Successfully cancelled take profit order {position.tp_order_id}")
+                    position.tp_order_id = None
                 else:
-                    logger.warning(f"Failed to cancel SL order {position.sl_order_id} for {position.symbol}")
+                    logger.error(f"Failed to cancel take profit order {position.tp_order_id}")
                     success = False
-            except Exception as e:
-                logger.error(f"Error cancelling SL order: {str(e)}")
-                success = False
-        
-        return success
+            
+            # Wait a moment after cancelling orders
+            time.sleep(1)
+            
+            return success
+            
+        except Exception as e:
+            logger.exception(f"Error cancelling TP/SL orders: {str(e)}")
+            return False
     
     def check_positions(self):
         """

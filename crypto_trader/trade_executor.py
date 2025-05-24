@@ -5,6 +5,7 @@ import time
 import signal
 import sys
 import logging
+import asyncio
 
 from crypto_trader.api import TelegramNotifier, CryptoExchangeAPI, GoogleSheetManager
 from crypto_trader.strategies import PositionManager
@@ -175,19 +176,35 @@ class TradeExecutor:
         """Clean up resources before exit"""
         logger.info("Cleaning up resources")
         
-        # Close connections
+        # Close connections in reverse order of initialization
         try:
-            if self.position_manager:
+            # First close position manager as it depends on other components
+            if hasattr(self, 'position_manager'):
                 self.position_manager.close()
-                
-            if self.telegram:
-                self.telegram.close()
-                
-            if self.exchange_api:
-                self.exchange_api.close()
-                
-            if self.sheet_manager:
+                logger.debug("Position manager closed")
+            
+            # Then close sheet manager
+            if hasattr(self, 'sheet_manager'):
                 self.sheet_manager.close()
+                logger.debug("Sheet manager closed")
+            
+            # Then close exchange API
+            if hasattr(self, 'exchange_api'):
+                self.exchange_api.close()
+                logger.debug("Exchange API closed")
+            
+            # Finally close telegram notifier
+            if hasattr(self, 'telegram'):
+                # Create a new event loop for async cleanup
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self.telegram.close())
+                    logger.debug("Telegram notifier closed")
+                except Exception as e:
+                    logger.error(f"Error closing telegram notifier: {str(e)}")
+                finally:
+                    loop.close()
                 
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")

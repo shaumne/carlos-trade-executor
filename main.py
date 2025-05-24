@@ -18,8 +18,35 @@ import os
 import sys
 import argparse
 import logging
+import asyncio
+import signal
 
 from crypto_trader.trade_executor import main as executor_main
+
+# Store active clients for cleanup
+active_clients = set()
+
+def register_client(client):
+    active_clients.add(client)
+    
+def unregister_client(client):
+    active_clients.discard(client)
+
+async def cleanup():
+    """Clean up all active client sessions"""
+    cleanup_tasks = []
+    for client in active_clients:
+        if hasattr(client, 'close'):
+            cleanup_tasks.append(client.close())
+    if cleanup_tasks:
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+def signal_handler(sig, frame):
+    """Handle shutdown signals"""
+    print("\nShutting down gracefully...")
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(cleanup())
+    sys.exit(0)
 
 def parse_args():
     """Parse command line arguments"""
@@ -34,14 +61,26 @@ def parse_args():
 
 def main():
     """Main entry point"""
-    # Parse command line arguments
-    args = parse_args()
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
-    # Set log level
-    os.environ["LOG_LEVEL"] = args.log_level
-    
-    # Run the executor
-    executor_main()
+    try:
+        # Parse command line arguments
+        args = parse_args()
+        
+        # Set log level
+        os.environ["LOG_LEVEL"] = args.log_level
+        
+        # Run the executor
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(executor_main())
+    except Exception as e:
+        print(f"Error in main: {e}")
+    finally:
+        # Ensure cleanup runs
+        loop.run_until_complete(cleanup())
+        loop.close()
 
 if __name__ == "__main__":
     main() 

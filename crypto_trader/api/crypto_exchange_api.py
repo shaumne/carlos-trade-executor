@@ -777,7 +777,12 @@ class CryptoExchangeAPI:
             return False
             
     def close(self):
-        """Close session and clean up resources"""
+        """Close resources properly"""
         if self._session:
-            self._session.close()
-            self._session = None 
+            try:
+                self._session.close()
+                logger.debug("API session closed")
+            except Exception as e:
+                logger.error(f"Error closing API session: {str(e)}")
+            finally:
+                self._session = None 
