@@ -4,6 +4,7 @@
 import time
 import threading
 from datetime import datetime
+import asyncio
 
 from crypto_trader.config import config
 from crypto_trader.utils import setup_logger, format_quantity
@@ -107,6 +108,10 @@ class PositionManager:
         self.check_interval = 60  # Check positions every 60 seconds
         self._stop_event = threading.Event()
         
+        # Create event loop for async operations
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
         # Start background position monitoring thread
         self._monitoring_thread = threading.Thread(
             target=self.update_positions_periodically,
@@ -115,6 +120,22 @@ class PositionManager:
         self._monitoring_thread.start()
         logger.info("Position monitoring thread started")
         
+    async def _send_telegram_message(self, message):
+        """Send a Telegram message asynchronously"""
+        if self.telegram_notifier:
+            try:
+                await self.telegram_notifier.send_message_async(message)
+            except Exception as e:
+                logger.error(f"Error sending Telegram message: {str(e)}")
+                
+    def _notify_telegram(self, message):
+        """Send a Telegram message using the event loop"""
+        if self.telegram_notifier:
+            try:
+                self.loop.run_until_complete(self._send_telegram_message(message))
+            except Exception as e:
+                logger.error(f"Error sending Telegram notification: {str(e)}")
+                
     def get_position(self, symbol):
         """
         Get a position by symbol
@@ -423,7 +444,7 @@ class PositionManager:
                     entry_price = position.price
                     profit_loss = ((actual_sell_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                     
-                    self.telegram_notifier.send_message(
+                    message = (
                         f"🔴 SELL Order Filled!\n"
                         f"Symbol: {symbol}\n"
                         f"Sell Price: {actual_sell_price}\n"
@@ -431,6 +452,7 @@ class PositionManager:
                         f"P/L: {profit_loss:.2f}%\n"
                         f"Order ID: {sell_order_id}"
                     )
+                    self._notify_telegram(message)
                 
                 # Remove position
                 self.remove_position(symbol)
@@ -444,19 +466,21 @@ class PositionManager:
             logger.error(f"Error executing sell for {symbol}: {str(e)}")
             return False
     
-    def _monitor_order(self, position, max_checks=30, check_interval=5):
+    def _monitor_order(self, position, order_id=None, max_checks=30, check_interval=5):
         """
         Monitor order until it's filled or timeout
         
         Args:
             position (Position): Position to monitor
+            order_id (str, optional): Specific order ID to monitor (overrides position.order_id)
             max_checks (int): Maximum number of status checks
             check_interval (float): Time between checks in seconds
             
         Returns:
             bool: True if order filled, False otherwise
         """
-        order_id = position.order_id
+        # Use provided order_id if available, otherwise use position's order_id
+        order_id = order_id or position.order_id
         symbol = position.symbol
         checks = 0
         
@@ -464,21 +488,18 @@ class PositionManager:
         
         while checks < max_checks:
             try:
-                # Get order details
-                method = "private/get-order-detail"
-                params = {"order_id": order_id}
-                order_detail = self.exchange_api.send_request(method, params)
+                # Get order details using exchange API's get_order_details method
+                order_detail = self.exchange_api.get_order_details(order_id)
                 
-                if not order_detail or order_detail.get("code") != 0:
+                if not order_detail:
                     logger.warning(f"Could not get details for order {order_id}")
                     time.sleep(check_interval)
                     checks += 1
                     continue
                 
-                result = order_detail.get("result", {})
-                status = result.get("status")
-                cumulative_quantity = float(result.get("cumulative_quantity", 0))
-                avg_price = float(result.get("avg_price", 0))
+                status = order_detail.get("status")
+                cumulative_quantity = float(order_detail.get("cumulative_quantity", 0))
+                avg_price = float(order_detail.get("avg_price", 0))
                 
                 logger.debug(f"Order {order_id} status: {status}")
                 
@@ -766,24 +787,16 @@ class PositionManager:
         return count
     
     def _notify_order_filled(self, position):
-        """
-        Send notification for filled order
-        
-        Args:
-            position (Position): Position with filled order
-        """
-        if not self.telegram_notifier:
-            return
-            
-        self.telegram_notifier.send_message(
-            f"🟢 BUY Order Filled!\n"
-            f"Symbol: {position.symbol}\n"
-            f"Entry Price: {position.price}\n"
-            f"Quantity: {position.quantity}\n"
-            f"Take Profit: {position.take_profit}\n"
-            f"Stop Loss: {position.stop_loss}\n"
-            f"Order ID: {position.order_id}"
-        )
+        """Send notification when order is filled"""
+        if self.telegram_notifier:
+            message = (
+                f"🟢 BUY Order Filled!\n"
+                f"Symbol: {position.symbol}\n"
+                f"Price: {position.price}\n"
+                f"Quantity: {position.quantity}\n"
+                f"Order ID: {position.order_id}"
+            )
+            self._notify_telegram(message)
     
     def update_position_status(self):
         """
@@ -935,9 +948,21 @@ class PositionManager:
         return None
     
     def close(self):
-        """Properly clean up resources"""
-        logger.info("Shutting down position manager...")
+        """Clean up resources"""
         self._stop_event.set()
-        if self._monitoring_thread and self._monitoring_thread.is_alive():
-            self._monitoring_thread.join(timeout=5.0)
-        logger.info("Position manager shutdown complete") 
+        if self._monitoring_thread.is_alive():
+            self._monitoring_thread.join(timeout=5)
+        if self.loop and not self.loop.is_closed():
+            self.loop.close()
+            
+    def _notify_order_filled(self, position):
+        """Send notification when order is filled"""
+        if self.telegram_notifier:
+            message = (
+                f"🟢 BUY Order Filled!\n"
+                f"Symbol: {position.symbol}\n"
+                f"Price: {position.price}\n"
+                f"Quantity: {position.quantity}\n"
+                f"Order ID: {position.order_id}"
+            )
+            self._notify_telegram(message) 

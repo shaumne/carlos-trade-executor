@@ -429,6 +429,9 @@ class CryptoExchangeAPI:
             # Extract base currency from instrument_name
             base_currency = instrument_name.split('_')[0]
             
+            # Generate unique client order ID
+            client_order_id = f"SELL_{instrument_name}_{int(time.time() * 1000)}"
+            
             # SAFETY CHECK: Prevent usage of notional parameter for SELL orders
             if notional is not None:
                 logger.critical("CRITICAL ERROR: 'notional' parameter was passed to sell_coin, but this is not allowed!")
@@ -470,14 +473,15 @@ class CryptoExchangeAPI:
                 usd_value = float(formatted_quantity) * float(current_price)
                 logger.info(f"Attempting to sell {formatted_quantity} {base_currency} (approx. ${usd_value:.2f})")
             
-            # Create the order request
+            # Create the order request with client_order_id
             response = self.send_request(
                 "private/create-order", 
                 {
                     "instrument_name": instrument_name,
                     "side": "SELL",
                     "type": "MARKET",
-                    "quantity": formatted_quantity
+                    "quantity": formatted_quantity,
+                    "client_oid": client_order_id
                 }
             )
             
@@ -599,6 +603,9 @@ class CryptoExchangeAPI:
                     
                     logger.info(f"Batch {i+1}/{num_batches}: Selling {formatted_batch} {base_currency}")
                     
+                    # Generate unique client order ID for this batch
+                    batch_client_order_id = f"SELL_{instrument_name}_BATCH_{i+1}_{int(time.time() * 1000)}"
+                    
                     # Create sell order for this batch
                     batch_response = self.send_request(
                         "private/create-order", 
@@ -606,7 +613,8 @@ class CryptoExchangeAPI:
                             "instrument_name": instrument_name,
                             "side": "SELL",
                             "type": "MARKET",
-                            "quantity": formatted_batch
+                            "quantity": formatted_batch,
+                            "client_oid": batch_client_order_id
                         }
                     )
                     
@@ -749,13 +757,13 @@ class CryptoExchangeAPI:
     
     def cancel_order(self, order_id):
         """
-        Cancel an order
+        Cancel an existing order
         
         Args:
-            order_id (str): Order ID
+            order_id (str): The order ID to cancel
             
         Returns:
-            bool: True if successful, False otherwise
+            bool: True if cancelled successfully, False otherwise
         """
         try:
             method = "private/cancel-order"
@@ -785,4 +793,41 @@ class CryptoExchangeAPI:
             except Exception as e:
                 logger.error(f"Error closing API session: {str(e)}")
             finally:
-                self._session = None 
+                self._session = None
+
+    @retry(max_retries=3, retry_delay=1.0)
+    def get_order_details(self, order_id):
+        """
+        Get detailed information about a specific order
+        
+        Args:
+            order_id (str): The order ID to query
+            
+        Returns:
+            dict: Order details or None on failure
+        """
+        try:
+            method = "private/get-order-detail"
+            params = {
+                "order_id": str(order_id)
+            }
+            
+            response = self.send_request(method, params)
+            
+            if response.get("code") == 0:
+                result = response.get("result", {})
+                if result and isinstance(result, list) and len(result) > 0:
+                    logger.debug(f"Successfully fetched order details for {order_id}")
+                    return result[0]  # Return first order detail
+                else:
+                    logger.warning(f"No order details found for order ID {order_id}")
+                    return None
+            else:
+                error_code = response.get("code")
+                error_msg = response.get("message", response.get("msg", "Unknown error"))
+                logger.error(f"API error getting order details: {error_code} - {error_msg}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting order details: {str(e)}")
+            return None 

@@ -15,11 +15,16 @@ class TelegramNotifier:
     """
     Handles telegram notifications with proper async management and error handling
     """
-    def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
+    def __init__(self, token: str = None, chat_id: str = None):
+        self.token = token or config.TELEGRAM_BOT_TOKEN
+        self.chat_id = chat_id or config.TELEGRAM_CHAT_ID
+        
+        if not self.token or not self.chat_id:
+            logger.warning("Telegram bot not configured (missing token or chat_id)")
+            
         self.logger = setup_logger("telegram_notifier")
         self._session: Optional[aiohttp.ClientSession] = None
+        self.loop = None
         
     async def __aenter__(self):
         connector = aiohttp.TCPConnector(ssl=False)
@@ -34,6 +39,7 @@ class TelegramNotifier:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(ssl=False)
             self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
             
     async def close(self):
         """
@@ -47,7 +53,7 @@ class TelegramNotifier:
                     if self.loop.is_closed():
                         self.loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(self.loop)
-                    self.loop.run_until_complete(self.close_session())
+                    await self.close_session()
                 
                 # Close the loop
                 self.loop.close()
@@ -58,18 +64,26 @@ class TelegramNotifier:
                     try:
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
-                        loop.run_until_complete(self._session.close())
+                        await self._session.close()
                         loop.close()
                     except Exception as e:
                         logger.error(f"Failed to close session in fallback: {str(e)}")
-                        pass
             
     async def close_session(self):
         if self._session and not self._session.closed:
             await self._session.close()
             
-    @retry(attempts=3, delay=1)
+    @retry(max_retries=3, retry_delay=1)
     async def send_message(self, message: str) -> bool:
+        """
+        Send a message to Telegram with retries
+        
+        Args:
+            message (str): Message to send
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
         try:
             await self.ensure_session()
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
@@ -92,9 +106,10 @@ class TelegramNotifier:
             self.logger.error(f"Error sending message: {str(e)}")
             return False
 
+    @retry(max_retries=2, retry_delay=1.0)
     async def send_message_async(self, message):
         """
-        Send Telegram message asynchronously
+        Send Telegram message asynchronously with retries
         
         Args:
             message (str): Message text
@@ -131,7 +146,6 @@ class TelegramNotifier:
             logger.error(f"Failed to send Telegram message: {str(e)}")
             return False
     
-    @retry(max_retries=2, retry_delay=1.0)
     def send_message_sync(self, message):
         """
         Send Telegram message (synchronous wrapper)
@@ -147,37 +161,13 @@ class TelegramNotifier:
             return False
             
         try:
+            # Create event loop if needed
+            if not self.loop or self.loop.is_closed():
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+            
             # Run the async method in the event loop
             return self.loop.run_until_complete(self.send_message_async(message))
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {str(e)}")
-            return False
-            
-    def close(self):
-        """
-        Close resources properly
-        """
-        if self.loop and not self.loop.is_closed():
-            try:
-                # Close aiohttp session
-                if self._session and not self._session.closed:
-                    # Create a new event loop if needed
-                    if self.loop.is_closed():
-                        self.loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(self.loop)
-                    self.loop.run_until_complete(self.close_session())
-                
-                # Close the loop
-                self.loop.close()
-            except Exception as e:
-                logger.error(f"Error closing Telegram notifier resources: {str(e)}")
-                # Make best effort to close session
-                if self._session and not self._session.closed:
-                    try:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        loop.run_until_complete(self._session.close())
-                        loop.close()
-                    except Exception as e:
-                        logger.error(f"Failed to close session in fallback: {str(e)}")
-                        pass 
+            return False 

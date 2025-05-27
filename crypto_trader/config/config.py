@@ -3,16 +3,28 @@
 
 import os
 import os.path
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Get the project root directory
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Load environment variables from .env file in project root
+env_path = os.path.join(PROJECT_ROOT, '.env')
+load_dotenv(dotenv_path=env_path)
 
 # API Credentials
 CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY")
 CRYPTO_API_SECRET = os.getenv("CRYPTO_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    print("Warning: Telegram credentials not found in .env file")
+    print(f"Looking for .env file at: {env_path}")
+    print(f"Current environment variables:")
+    print(f"TELEGRAM_BOT_TOKEN: {'Set' if TELEGRAM_BOT_TOKEN else 'Not Set'}")
+    print(f"TELEGRAM_CHAT_ID: {'Set' if TELEGRAM_CHAT_ID else 'Not Set'}")
 
 # Trading Parameters
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "10"))  # Default trade amount in USDT
@@ -47,7 +59,7 @@ DEFAULT_PRECISION = 2
 
 # Log Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_FILE = os.getenv("LOG_FILE", os.path.join(os.path.expanduser("~"), "crypto_trader.log"))
+LOG_FILE = os.path.join(os.path.expanduser("~"), "crypto_trader.log")
 
 # Retry Configuration
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))

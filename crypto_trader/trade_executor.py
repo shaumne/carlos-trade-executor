@@ -13,7 +13,7 @@ from crypto_trader.utils import setup_logger
 from crypto_trader.config import config
 
 # Set up logger
-logger = setup_logger("trade_executor", config.LOG_FILE)
+logger = setup_logger("trade_executor", logging.INFO)
 
 class TradeExecutor:
     """
@@ -28,7 +28,7 @@ class TradeExecutor:
         # Initialize components
         try:
             # Telegram notifier for alerts
-            self.telegram = TelegramNotifier()
+            self.telegram = TelegramNotifier()  # No need to pass token and chat_id, will get from config
             logger.info("Initialized Telegram notifier")
             
             # Exchange API for trading
@@ -127,13 +127,25 @@ class TradeExecutor:
             logger.error(f"Error monitoring positions: {str(e)}")
             return 0
     
+    async def send_telegram_message(self, message):
+        """Send a Telegram message asynchronously"""
+        if self.telegram:
+            try:
+                await self.telegram.send_message_async(message)
+            except Exception as e:
+                logger.error(f"Error sending Telegram message: {str(e)}")
+
     def run(self):
         """Main execution loop"""
         logger.info("Starting Trade Executor")
         
+        # Create event loop for async operations
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         # Send startup notification
         if self.telegram:
-            self.telegram.send_message("🤖 Trading Bot Started")
+            loop.run_until_complete(self.send_telegram_message("🤖 Trading Bot Started"))
         
         self.running = True
         last_report_time = 0
@@ -166,11 +178,12 @@ class TradeExecutor:
             
             # Send crash notification
             if self.telegram:
-                self.telegram.send_message(f"⚠️ Trading Bot Crashed: {str(e)}")
+                loop.run_until_complete(self.send_telegram_message(f"⚠️ Trading Bot Crashed: {str(e)}"))
             
             raise
         finally:
             self.cleanup()
+            loop.close()
     
     def cleanup(self):
         """Clean up resources before exit"""
