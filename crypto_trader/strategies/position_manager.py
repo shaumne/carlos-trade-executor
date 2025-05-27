@@ -205,241 +205,243 @@ class PositionManager:
             return position
     
     def execute_buy(self, signal):
-        """
-        Execute a buy order based on a signal
-        
-        Args:
-            signal (dict): Buy signal data
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        symbol = signal['symbol']
-        row_index = signal['row_index']
-        
-        # Check if we already have an active position
-        if self.has_active_position(symbol):
-            logger.warning(f"Already have an active position for {symbol}, skipping buy")
-            return False
-        
-        # Check if we have sufficient balance
-        if not self.exchange_api.has_sufficient_balance():
-            logger.error(f"Insufficient balance for trade {symbol}")
-            self.sheet_manager.update_trade_status(row_index, "INSUFFICIENT_BALANCE")
-            return False
-        
+        """Execute a buy trade based on the signal"""
         try:
-            # Get current price
-            current_price = self.exchange_api.get_current_price(symbol)
-            if not current_price:
-                logger.error(f"Could not get current price for {symbol}, skipping buy")
+            symbol = signal['symbol']
+            row_index = signal['row_index']
+            take_profit = float(signal['take_profit'])
+            stop_loss = float(signal['stop_loss'])
+            
+            # Check if we already have a position
+            if self.has_active_position(symbol):
+                logger.warning(f"Already have an active position for {symbol}, skipping buy")
                 return False
             
-            # Calculate stop loss and take profit
-            stop_loss = signal.get('stop_loss')
-            take_profit = signal.get('take_profit')
-            resistance_up = signal.get('resistance_up')
-            resistance_down = signal.get('resistance_down')
-            
-            # If stop loss or take profit are not provided, calculate them
-            if not stop_loss or stop_loss == 0:
-                stop_loss = self.atr_strategy.calculate_stop_loss(
-                    symbol, current_price, resistance_down
-                )
-            
-            if not take_profit or take_profit == 0:
-                take_profit = self.atr_strategy.calculate_take_profit(
-                    symbol, current_price, resistance_up
-                )
-            
-            # Execute buy order
-            order_id = self.exchange_api.buy_coin(symbol)
-            
-            if not order_id:
-                logger.error(f"Failed to create buy order for {symbol}")
-                self.sheet_manager.update_trade_status(row_index, "ORDER_FAILED")
+            # Check if we have sufficient balance
+            if not self.exchange_api.has_sufficient_balance():
+                logger.error(f"Insufficient balance for trade {symbol}")
+                self.sheet_manager.update_trade_status(row_index, "INSUFFICIENT_BALANCE")
                 return False
             
-            # Estimate quantity based on trade amount
-            estimated_quantity = config.TRADE_AMOUNT / current_price if current_price > 0 else 0
-            
-            # Update trade status in sheet
-            self.sheet_manager.update_trade_status(
-                row_index, 
-                "ORDER_PLACED", 
-                order_id, 
-                purchase_price=current_price, 
-                quantity=estimated_quantity,
-                stop_loss=stop_loss,
-                take_profit=take_profit
-            )
-            
-            # Create position object
-            position = Position(
-                symbol=symbol,
-                order_id=order_id,
-                row_index=row_index,
-                quantity=estimated_quantity,
-                price=current_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                status="ORDER_PLACED"
-            )
-            
-            # Add to positions
-            self.add_position(position)
-            
-            # Monitor the order
-            is_filled = self._monitor_order(position)
-            
-            if is_filled:
-                # Place TP/SL orders
-                self._place_tp_sl_orders(position, take_profit, stop_loss)
+            try:
+                # Get current price from API
+                current_price = self.exchange_api.get_current_price(symbol)
+                if not current_price:
+                    logger.error(f"Could not get current price for {symbol}, skipping buy")
+                    return False
                 
-                # Send notification
-                self._notify_order_filled(position)
-            else:
-                # Remove position if not filled
-                self.remove_position(symbol)
+                # Use trade amount in USDT
+                trade_amount = self.exchange_api.trade_amount
+                logger.info(f"Placing market buy order for {symbol} with ${trade_amount} USDT")
                 
-            return is_filled
-            
+                # Create market buy order
+                order_id = self.exchange_api.buy_coin(symbol, trade_amount)
+                
+                if not order_id:
+                    logger.error(f"Failed to create buy order for {symbol}")
+                    self.sheet_manager.update_trade_status(row_index, "ORDER_FAILED")
+                    return False
+                
+                # Estimate initial quantity (will be updated with actual quantity)
+                estimated_quantity = trade_amount / current_price if current_price > 0 else 0
+                logger.info(f"Estimated quantity: {estimated_quantity} (${trade_amount} / {current_price})")
+                
+                # Create position object
+                position = Position(
+                    symbol=symbol,
+                    order_id=order_id,
+                    row_index=row_index,
+                    quantity=estimated_quantity,
+                    price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    status="ORDER_PLACED"
+                )
+                
+                # Add to position manager
+                self.add_position(position)
+                
+                # Update sheet with initial order info
+                self.sheet_manager.update_trade_status(
+                    row_index,
+                    "ORDER_PLACED",
+                    order_id,
+                    purchase_price=current_price,
+                    quantity=estimated_quantity,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+                
+                # IMPORTANT: Wait for buy order to be filled before placing TP/SL orders
+                logger.info(f"Waiting for BUY order {order_id} to be filled before placing TP/SL orders")
+                is_filled = self._monitor_order(position)
+                
+                if is_filled:
+                    # Get actual quantity and price from filled order
+                    order_details = self.exchange_api.get_order_details(order_id)
+                    if order_details:
+                        actual_quantity = float(order_details.get('cumulative_quantity', estimated_quantity))
+                        actual_price = float(order_details.get('avg_price', current_price))
+                        
+                        # Update position with actual values
+                        position.quantity = actual_quantity
+                        position.price = actual_price
+                        position.status = "POSITION_ACTIVE"
+                        
+                        logger.info(f"BUY order filled! Using actual quantity ({actual_quantity}) for TP/SL orders")
+                        
+                        # Place TP/SL orders with actual quantity
+                        tp_order_id, sl_order_id = self._place_tp_sl_orders(
+                            position,
+                            take_profit,
+                            stop_loss
+                        )
+                        
+                        if tp_order_id or sl_order_id:
+                            position.tp_order_id = tp_order_id
+                            position.sl_order_id = sl_order_id
+                            logger.info(f"TP/SL orders created for {symbol}: TP={tp_order_id}, SL={sl_order_id}")
+                            
+                            # Update sheet with TP/SL order IDs
+                            notes = f"TP Order: {tp_order_id or 'Failed'}, SL Order: {sl_order_id or 'Failed'}"
+                            self.sheet_manager.update_cell(row_index, "Notes", notes)
+                            
+                            # Send detailed notification
+                            if self.telegram_notifier:
+                                self.telegram_notifier.send_message(
+                                    f"🟢 BUY Order Filled!\n"
+                                    f"Symbol: {symbol}\n"
+                                    f"Entry Price: {actual_price}\n"
+                                    f"Quantity: {actual_quantity}\n"
+                                    f"TP: {take_profit}\n"
+                                    f"SL: {stop_loss}\n"
+                                    f"TP Order ID: {tp_order_id or 'N/A'}\n"
+                                    f"SL Order ID: {sl_order_id or 'N/A'}\n"
+                                    f"Main Order ID: {order_id}"
+                                )
+                    else:
+                        logger.warning(f"Could not get order details for {order_id}")
+                        
+                    return True
+                else:
+                    logger.warning(f"BUY order was not filled, cannot place TP/SL orders")
+                    # Remove position if not filled
+                    self.remove_position(symbol)
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Error executing buy trade for {symbol}: {str(e)}")
+                self.sheet_manager.update_trade_status(row_index, "ERROR")
+                return False
+                
         except Exception as e:
-            logger.error(f"Error executing buy for {symbol}: {str(e)}")
-            self.sheet_manager.update_trade_status(row_index, "ERROR")
+            logger.error(f"Error in execute_buy: {str(e)}")
             return False
     
     def execute_sell(self, signal):
-        """
-        Execute a sell order based on a signal
-        
-        Args:
-            signal (dict): Sell signal data
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        symbol = signal['symbol']
-        row_index = signal['row_index']
-        original_symbol = signal['original_symbol']
-        order_id_from_sheet = signal.get('order_id', '')
-        
+        """Execute a sell trade based on the signal"""
         try:
-            # Check if we have this position in our tracking
+            symbol = signal['symbol']
+            row_index = signal['row_index']
+            current_price = float(signal.get('last_price', 0))
+            
+            # Get position details
             position = self.get_position(symbol)
-            
             if not position:
-                logger.info(f"No tracked position for {symbol}, checking balance")
-                
-                # Get balance from exchange
-                base_currency = original_symbol
-                balance = self.exchange_api.get_balance(base_currency)
-                
-                if balance <= 0:
-                    logger.warning(f"No balance found for {base_currency}, cannot sell")
+                # Try to get quantity from balance if no position found
+                base_currency = symbol.split('_')[0]
+                try:
+                    balance = self.exchange_api.get_coin_balance(base_currency)
+                    if balance and float(balance) > 0:
+                        quantity = float(balance)
+                        logger.info(f"No position found but got balance of {quantity} {base_currency}")
+                        
+                        # Create temporary position object
+                        position = Position(
+                            symbol=symbol,
+                            order_id='manual',
+                            row_index=row_index,
+                            quantity=quantity,
+                            status="POSITION_ACTIVE"
+                        )
+                    else:
+                        logger.warning(f"No position or balance found for {symbol}")
+                        return False
+                except Exception as e:
+                    logger.error(f"Error getting balance for {base_currency}: {str(e)}")
                     return False
+            
+            # Cancel any existing TP/SL orders
+            if position.tp_order_id or position.sl_order_id:
+                self._cancel_tp_sl_orders(position)
+            
+            # Get current price if not provided
+            if current_price <= 0:
+                current_price = self.exchange_api.get_current_price(symbol)
+                if not current_price:
+                    logger.error(f"Could not get current price for {symbol}")
+                    return False
+            
+            # Execute sell order
+            logger.info(f"Selling {position.quantity} {symbol} at {current_price}")
+            sell_order_id = self.exchange_api.sell_coin(symbol, position.quantity)
+            
+            if not sell_order_id:
+                logger.error(f"Failed to create sell order for {symbol}")
+                return False
+            
+            # Monitor the sell order
+            is_filled = self._monitor_order(position, order_id=sell_order_id)
+            
+            if is_filled:
+                # Get actual sell details
+                sell_details = self.exchange_api.get_order_details(sell_order_id)
+                if sell_details:
+                    actual_sell_price = float(sell_details.get('avg_price', current_price))
+                    actual_sell_quantity = float(sell_details.get('cumulative_quantity', position.quantity))
+                else:
+                    actual_sell_price = current_price
+                    actual_sell_quantity = position.quantity
                 
-                # Create temporary position for the sell
-                position = Position(
-                    symbol=symbol,
-                    order_id=order_id_from_sheet or "manual",
-                    row_index=row_index,
-                    quantity=balance,
-                    price=0,  # Unknown entry price
-                    status="POSITION_ACTIVE"
+                # Update sheet with sell information
+                self.sheet_manager.update_trade_status(
+                    row_index,
+                    "SOLD",
+                    sell_price=actual_sell_price,
+                    quantity=actual_sell_quantity,
+                    sell_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
-            
-            # Cancel any TP/SL orders first
-            self._cancel_tp_sl_orders(position)
-            
-            # Wait a moment after cancelling orders
-            time.sleep(2)
-            
-            # Get current balance to ensure we have the correct amount
-            base_currency = original_symbol
-            current_balance = self.exchange_api.get_balance(base_currency)
-            
-            if current_balance <= 0:
-                logger.warning(f"No balance available for {base_currency} after cancelling orders")
+                
+                # Move to archive and clean up the coin line
+                self.sheet_manager.move_to_archive(row_index)
+                
+                # Clean up the coin line in the main sheet
+                self.sheet_manager.clean_coin_line(row_index)
+                
+                # Send notification
+                if self.telegram_notifier:
+                    entry_price = position.price
+                    profit_loss = ((actual_sell_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                    
+                    self.telegram_notifier.send_message(
+                        f"🔴 SELL Order Filled!\n"
+                        f"Symbol: {symbol}\n"
+                        f"Sell Price: {actual_sell_price}\n"
+                        f"Quantity: {actual_sell_quantity}\n"
+                        f"P/L: {profit_loss:.2f}%\n"
+                        f"Order ID: {sell_order_id}"
+                    )
+                
+                # Remove position
+                self.remove_position(symbol)
+                logger.info(f"Successfully sold {symbol}")
+                return True
+            else:
+                logger.warning(f"Sell order was not filled for {symbol}")
                 return False
                 
-            # Update position quantity with current balance
-            position.quantity = current_balance
-            
-            # Get current price for logging
-            current_price = self.exchange_api.get_current_price(symbol)
-            
-            # Execute sell order with retries
-            max_retries = 3
-            retry_count = 0
-            sell_successful = False
-            
-            while retry_count < max_retries and not sell_successful:
-                sell_order_id = self.exchange_api.sell_coin(symbol, position.quantity)
-                
-                if sell_order_id:
-                    logger.info(f"Successfully created sell order {sell_order_id} for {symbol}")
-                    
-                    # Wait for order status
-                    time.sleep(2)
-                    status = self.exchange_api.get_order_status(sell_order_id)
-                    
-                    if status == "FILLED":
-                        logger.info(f"Sell order {sell_order_id} was filled")
-                        sell_successful = True
-                        
-                        # Update sheet status
-                        self.sheet_manager.update_trade_status(
-                            row_index,
-                            "SOLD",
-                            sell_price=current_price,
-                            quantity=position.quantity,
-                            sell_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        )
-                        
-                        # Send Telegram notification
-                        if self.telegram_notifier:
-                            self.telegram_notifier.send_message(
-                                f"💰 SELL Order Filled!\n"
-                                f"Symbol: {symbol}\n"
-                                f"Price: {current_price}\n"
-                                f"Quantity: {position.quantity}\n"
-                                f"Order ID: {sell_order_id}"
-                            )
-                        
-                        # Move to archive
-                        if self.sheet_manager.move_to_archive(row_index):
-                            logger.info(f"Trade moved to archive for {symbol}")
-                        
-                        # Remove from active positions
-                        self.remove_position(symbol)
-                        
-                        return True
-                    elif status == "ACTIVE":
-                        logger.info(f"Sell order {sell_order_id} is still active")
-                        sell_successful = True
-                        return True
-                    elif status == "CANCELED" and retry_count < max_retries - 1:
-                        logger.warning(f"Order {sell_order_id} was cancelled, retrying...")
-                        time.sleep(2)
-                        retry_count += 1
-                        continue
-                    else:
-                        logger.error(f"Unexpected order status: {status}")
-                        retry_count += 1
-                else:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        logger.warning(f"Failed to create sell order, attempt {retry_count}/{max_retries}")
-                        time.sleep(2)
-                    else:
-                        logger.error(f"Failed to create sell order after {max_retries} attempts")
-                        return False
-            
-            return sell_successful
-                
         except Exception as e:
-            logger.exception(f"Error executing sell for {symbol}: {str(e)}")
+            logger.error(f"Error executing sell for {symbol}: {str(e)}")
             return False
     
     def _monitor_order(self, position, max_checks=30, check_interval=5):
@@ -521,7 +523,7 @@ class PositionManager:
     
     def _place_tp_sl_orders(self, position, take_profit, stop_loss):
         """
-        Place take profit and stop loss orders
+        Place TP and SL orders for a position using proper order types
         
         Args:
             position (Position): Position object
@@ -529,109 +531,128 @@ class PositionManager:
             stop_loss (float): Stop loss price
             
         Returns:
-            tuple: (tp_order_id, sl_order_id)
+            tuple: (tp_order_id, sl_order_id) or (None, None) if failed
         """
         try:
             symbol = position.symbol
             quantity = position.quantity
             
+            if quantity <= 0:
+                logger.error(f"Invalid quantity for {symbol}: {quantity}")
+                return None, None
+            
+            # Get base currency
+            base_currency = symbol.split('_')[0]
+            
+            # Verify actual balance
+            actual_balance = self.exchange_api.get_coin_balance(base_currency)
+            if actual_balance:
+                try:
+                    actual_balance_float = float(actual_balance)
+                    if actual_balance_float < quantity:
+                        logger.warning(f"Actual balance ({actual_balance_float}) is less than expected quantity ({quantity}). Using actual balance.")
+                        quantity = actual_balance_float * 0.99  # Use 99% of balance
+                except Exception as e:
+                    logger.error(f"Error converting balance to float: {str(e)}")
+            
             # Format quantity based on coin type
-            formatted_quantity = "{:.2f}".format(quantity)
+            if base_currency == "SUI":
+                # Use decimal format for SUI
+                formatted_quantity = "{:.2f}".format(quantity).rstrip('0').rstrip('.')
+                if float(formatted_quantity) == 0:
+                    formatted_quantity = "{:.2f}".format(quantity)  # Keep all decimals
+                logger.info(f"Using decimal format for SUI: {formatted_quantity}")
+            elif base_currency in ["BONK", "SHIB", "DOGE", "PEPE"]:
+                # For meme coins, use integer for large amounts, decimal for small
+                if quantity > 1:
+                    formatted_quantity = "{:.2f}".format(quantity)
+                else:
+                    formatted_quantity = "{:.2f}".format(quantity)
+                logger.info(f"Using adaptive format for meme coin {base_currency}: {formatted_quantity}")
+            elif base_currency in ["BTC", "ETH", "SOL"]:
+                # Use 2 decimals for major coins
+                formatted_quantity = "{:.2f}".format(quantity)
+                logger.info(f"Using 2 decimal places for {base_currency}: {formatted_quantity}")
+            else:
+                # Default to 2 decimal format
+                formatted_quantity = "{:.2f}".format(quantity)
+                logger.info(f"Using 2 decimal format for {base_currency}: {formatted_quantity}")
             
-            logger.info(f"Placing TP/SL orders for {symbol}: TP={take_profit}, SL={stop_loss}")
+            # Verify formatted quantity
+            if float(formatted_quantity) <= 0:
+                logger.error(f"Invalid formatted quantity: {formatted_quantity} for {symbol}")
+                return None, None
             
-            # Place stop loss order first
-            sl_params = {
-                "instrument_name": symbol,
-                "side": "SELL",
-                "type": "STOP_LOSS",
-                "quantity": formatted_quantity,
-                "price": "{:.8f}".format(stop_loss),
-                "ref_price": "{:.8f}".format(stop_loss),
-                "ref_price_type": "MARK_PRICE"
-            }
-            
-            sl_response = self.exchange_api.send_request("private/create-order", sl_params)
+            tp_order_id = None
             sl_order_id = None
             
-            if sl_response and sl_response.get("code") == 0:
-                sl_order_id = sl_response["result"]["order_id"]
-                logger.info(f"Successfully placed stop loss order at {stop_loss}, order ID: {sl_order_id}")
-                position.sl_order_id = sl_order_id
-            else:
-                logger.error(f"Failed to place stop loss order: {sl_response}")
+            try:
+                # Place Take Profit order with proper TAKE_PROFIT type
+                tp_params = {
+                    "instrument_name": symbol,
+                    "side": "SELL",
+                    "type": "TAKE_PROFIT_LIMIT",  # Using TAKE_PROFIT_LIMIT type
+                    "price": "{:.2f}".format(take_profit),
+                    "quantity": formatted_quantity,
+                    "trigger_price": "{:.2f}".format(take_profit),  # Using trigger_price instead of ref_price
+                    "trigger_price_type": "MARK_PRICE"  # Using trigger_price_type
+                }
                 
-                # Try with LIMIT order type
-                logger.info("Trying with LIMIT order type for SL")
-                sl_params["type"] = "LIMIT"
-                if "ref_price" in sl_params:
-                    del sl_params["ref_price"]
-                if "ref_price_type" in sl_params:
-                    del sl_params["ref_price_type"]
+                tp_response = self.exchange_api.send_request("private/create-order", tp_params)
                 
-                sl_retry_response = self.exchange_api.send_request("private/create-order", sl_params)
-                if sl_retry_response and sl_retry_response.get("code") == 0:
-                    sl_order_id = sl_retry_response["result"]["order_id"]
-                    logger.info(f"Successfully placed SL order with LIMIT type, order ID: {sl_order_id}")
-                    position.sl_order_id = sl_order_id
-            
-            # Place take profit order
-            tp_params = {
-                "instrument_name": symbol,
-                "side": "SELL",
-                "type": "TAKE_PROFIT",
-                "quantity": formatted_quantity,
-                "price": "{:.8f}".format(take_profit),
-                "ref_price": "{:.8f}".format(take_profit),
-                "ref_price_type": "MARK_PRICE"
-            }
-            
-            tp_response = self.exchange_api.send_request("private/create-order", tp_params)
-            tp_order_id = None
-            
-            if tp_response and tp_response.get("code") == 0:
-                tp_order_id = tp_response["result"]["order_id"]
-                logger.info(f"Successfully placed take profit order at {take_profit}, order ID: {tp_order_id}")
-                position.tp_order_id = tp_order_id
-            else:
-                logger.error(f"Failed to place take profit order: {tp_response}")
+                if tp_response and tp_response.get("code") == 0:
+                    tp_order_id = tp_response["result"]["order_id"]
+                    logger.info(f"Successfully placed TP order for {symbol} at {take_profit}, order ID: {tp_order_id}")
+                else:
+                    logger.error(f"Failed to place TP order: {tp_response}")
+                    
+                    # Try with regular TAKE_PROFIT type
+                    logger.info(f"Trying with regular TAKE_PROFIT type")
+                    tp_params["type"] = "TAKE_PROFIT"
+                    
+                    tp_retry_response = self.exchange_api.send_request("private/create-order", tp_params)
+                    
+                    if tp_retry_response and tp_retry_response.get("code") == 0:
+                        tp_order_id = tp_retry_response["result"]["order_id"]
+                        logger.info(f"Successfully placed TP order with TAKE_PROFIT type, order ID: {tp_order_id}")
                 
-                # Try with LIMIT order type
-                logger.info("Trying with LIMIT order type for TP")
-                tp_params["type"] = "LIMIT"
-                if "ref_price" in tp_params:
-                    del tp_params["ref_price"]
-                if "ref_price_type" in tp_params:
-                    del tp_params["ref_price_type"]
+                # Place Stop Loss order with proper STOP_LOSS type
+                sl_params = {
+                    "instrument_name": symbol,
+                    "side": "SELL",
+                    "type": "STOP_LOSS_LIMIT",  # Using STOP_LOSS_LIMIT type
+                    "price": "{:.2f}".format(stop_loss),
+                    "quantity": formatted_quantity,
+                    "trigger_price": "{:.2f}".format(stop_loss),  # Using trigger_price instead of ref_price
+                    "trigger_price_type": "MARK_PRICE"  # Using trigger_price_type
+                }
                 
-                tp_retry_response = self.exchange_api.send_request("private/create-order", tp_params)
-                if tp_retry_response and tp_retry_response.get("code") == 0:
-                    tp_order_id = tp_retry_response["result"]["order_id"]
-                    logger.info(f"Successfully placed TP order with LIMIT type, order ID: {tp_order_id}")
-                    position.tp_order_id = tp_order_id
-            
-            # Update sheet with TP/SL orders
-            self.sheet_manager.update_trade_status(
-                position.row_index,
-                "UPDATE_TP_SL",
-                stop_loss=stop_loss,
-                take_profit=take_profit
-            )
-            
-            # Send notification
-            if self.telegram_notifier:
-                self.telegram_notifier.send_message(
-                    f"🎯 TP/SL Orders Placed for {symbol}:\n"
-                    f"Take Profit: {take_profit}\n"
-                    f"Stop Loss: {stop_loss}\n"
-                    f"TP Order ID: {tp_order_id or 'Failed'}\n"
-                    f"SL Order ID: {sl_order_id or 'Failed'}"
-                )
-            
-            return tp_order_id, sl_order_id
-            
+                sl_response = self.exchange_api.send_request("private/create-order", sl_params)
+                
+                if sl_response and sl_response.get("code") == 0:
+                    sl_order_id = sl_response["result"]["order_id"]
+                    logger.info(f"Successfully placed SL order for {symbol} at {stop_loss}, order ID: {sl_order_id}")
+                else:
+                    logger.error(f"Failed to place SL order: {sl_response}")
+                    
+                    # Try with regular STOP_LOSS type
+                    logger.info(f"Trying with regular STOP_LOSS type")
+                    sl_params["type"] = "STOP_LOSS"
+                    
+                    sl_retry_response = self.exchange_api.send_request("private/create-order", sl_params)
+                    
+                    if sl_retry_response and sl_retry_response.get("code") == 0:
+                        sl_order_id = sl_retry_response["result"]["order_id"]
+                        logger.info(f"Successfully placed SL order with STOP_LOSS type, order ID: {sl_order_id}")
+                
+                return tp_order_id, sl_order_id
+                
+            except Exception as e:
+                logger.error(f"Error placing TP/SL orders for {symbol}: {str(e)}")
+                return None, None
+                
         except Exception as e:
-            logger.exception(f"Error placing TP/SL orders: {str(e)}")
+            logger.error(f"Error in _place_tp_sl_orders for {symbol}: {str(e)}")
             return None, None
             
     def _cancel_tp_sl_orders(self, position):
